@@ -16,7 +16,7 @@ void sptrsv_cpu(CSRMatrix* L, DenseMatrix* B, DenseMatrix* X){
                 if(col < i){
                     sum -= val * X->values[col * nB + b];
                 } else if(col == i){
-                    diag = val !=0 ? val : 1.0f; // Avoid division by zero
+                    diag = val !=0 ? val : 1.0f; 
                 }
             }
             X->values[i * nB + b] = sum / diag;
