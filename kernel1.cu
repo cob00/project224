@@ -1,6 +1,8 @@
 #include "common.h"
 #include "matrix.h"
 
+#define TILE 512
+
 __global__ void sptrsv_kernel1(
     unsigned int  numRows,
     unsigned int* rowPtrs,
@@ -12,26 +14,12 @@ __global__ void sptrsv_kernel1(
     float*        xValues,
     unsigned int  numCols,
     int*          dep_counter,
-    unsigned int* row_dep_count,
-    unsigned int  maxNnz
+    unsigned int* row_dep_count
 ) {
     unsigned int row = blockIdx.x;
     unsigned int col = threadIdx.x;
 
     if (row >= numRows || col >= numCols) return;
-
-    unsigned int rowStart = rowPtrs[row];
-    unsigned int rowEnd   = rowPtrs[row + 1];
-    unsigned int nnz      = rowEnd - rowStart;
-
-    extern __shared__ char smem[];
-    unsigned int* s_cols = (unsigned int*) smem;
-    float*        s_vals = (float*) (smem + maxNnz * sizeof(unsigned int));
-
-    for (unsigned int j = col; j < nnz; j += numCols) {
-        s_cols[j] = colIdxs[rowStart + j];
-        s_vals[j] = matValues[rowStart + j];
-    }
 
     if (row > 0) {
         while (atomicAdd(&dep_counter[row], 0) < (int)row_dep_count[row]) {
@@ -40,22 +28,38 @@ __global__ void sptrsv_kernel1(
     }
     __threadfence();
 
-    __syncthreads();
+    unsigned int rowStart = rowPtrs[row];
+    unsigned int rowEnd   = rowPtrs[row + 1];
 
+    extern __shared__ char smem[];
+    unsigned int* s_cols = (unsigned int*) smem;
+    float*        s_vals = (float*)(smem + TILE * sizeof(unsigned int));
+
+    float sum  = bValues[row * numCols + col];
     float diag = 1.0f;
-    for (unsigned int j = 0; j < nnz; ++j) {
-        if (s_cols[j] == row) {
-            diag = s_vals[j] != 0.0f ? s_vals[j] : 1.0f;
-            break;
-        }
-    }
 
-    float sum = bValues[row * numCols + col];
-    for (unsigned int j = 0; j < nnz; ++j) {
-        unsigned int c = s_cols[j];
-        if (c < row) {
-            sum -= s_vals[j] * xValues[c * numCols + col];
+    for (unsigned int base = rowStart; base < rowEnd; base += TILE) {
+        unsigned int tileEnd  = base + TILE < rowEnd ? base + TILE : rowEnd;
+        unsigned int tileSize = tileEnd - base;
+
+        // Collaboratively load tile into shared memory
+        for (unsigned int j = col; j < tileSize; j += numCols) {
+            s_cols[j] = colIdxs[base + j];
+            s_vals[j] = matValues[base + j];
         }
+        __syncthreads();
+
+        // All threads compute using shared tile
+        for (unsigned int j = 0; j < tileSize; ++j) {
+            unsigned int c = s_cols[j];
+            float val = s_vals[j];
+            if (c < row) {
+                sum -= val * xValues[c * numCols + col];
+            } else if (c == row) {
+                diag = val != 0.0f ? val : 1.0f;
+            }
+        }
+        __syncthreads();
     }
 
     xValues[row * numCols + col] = sum / diag;
@@ -106,13 +110,8 @@ void sptrsv_gpu1(CSCMatrix* L_c, CSRMatrix* L_r, DenseMatrix* B, DenseMatrix* X,
     cudaMemcpy(&b_shadow, B, sizeof(DenseMatrix), cudaMemcpyDeviceToHost);
     cudaMemcpy(&x_shadow, X, sizeof(DenseMatrix), cudaMemcpyDeviceToHost);
 
-    unsigned int maxNnz = 0;
-    for (unsigned int i = 0; i < n; ++i) {
-        unsigned int nnz = L_r_host->rowPtrs[i + 1] - L_r_host->rowPtrs[i];
-        if (nnz > maxNnz) maxNnz = nnz;
-    }
-
-    unsigned int smemSize = maxNnz * (sizeof(unsigned int) + sizeof(float));
+    // Shared memory: TILE * (uint + float) = 512 * 8 = 4096 bytes — well within 48KB
+    unsigned int smemSize = TILE * (sizeof(unsigned int) + sizeof(float));
 
     dim3 grid(n);
     dim3 block(numCols);
@@ -128,8 +127,7 @@ void sptrsv_gpu1(CSCMatrix* L_c, CSRMatrix* L_r, DenseMatrix* B, DenseMatrix* X,
         x_shadow.values,
         numCols,
         dep_counter_d,
-        row_dep_count_d,
-        maxNnz
+        row_dep_count_d
     );
 
     cudaFree(dep_counter_d);
