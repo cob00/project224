@@ -12,7 +12,8 @@ __global__ void sptrsv_kernel1(
     float*        xValues,
     unsigned int  numCols,
     int*          dep_counter,
-    unsigned int* row_dep_count
+    unsigned int* row_dep_count,
+    unsigned int  maxNnz
 ) {
     unsigned int row = blockIdx.x;
     unsigned int col = threadIdx.x;
@@ -25,7 +26,7 @@ __global__ void sptrsv_kernel1(
 
     extern __shared__ char smem[];
     unsigned int* s_cols = (unsigned int*) smem;
-    float*        s_vals = (float*) (smem + nnz * sizeof(unsigned int));
+    float*        s_vals = (float*) (smem + maxNnz * sizeof(unsigned int));
 
     for (unsigned int j = col; j < nnz; j += numCols) {
         s_cols[j] = colIdxs[rowStart + j];
@@ -127,7 +128,8 @@ void sptrsv_gpu1(CSCMatrix* L_c, CSRMatrix* L_r, DenseMatrix* B, DenseMatrix* X,
         x_shadow.values,
         numCols,
         dep_counter_d,
-        row_dep_count_d
+        row_dep_count_d,
+        maxNnz
     );
 
     cudaFree(dep_counter_d);
