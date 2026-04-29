@@ -1,6 +1,6 @@
 
 NVCC        = nvcc
-NVCC_FLAGS  = -O3
+NVCCFLAGS = -O3 -std=c++11
 OBJ         = main.o matrix.o kernelCPU.o kernel0.o kernel1.o kernel2.o kernel3.o
 EXE         = sptrsv
 
