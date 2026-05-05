@@ -164,7 +164,7 @@ void sptrsv_gpu3(CSCMatrix* L_c, CSRMatrix* L_r, DenseMatrix* B, DenseMatrix* X,
     float* x_old = x_shadow.values;  
     float* x_new = d_x_temp;
 
-    int max_iters = 15;  
+    int max_iters = 18;  
     for (int iter = 0; iter < max_iters; ++iter) {
         jacobi_kernel<<<n, numCols>>>(
             csr_shadow.rowPtrs,
