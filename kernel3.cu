@@ -1,5 +1,6 @@
 #include "common.h"
 #include "matrix.h"
+#include <stdio.h>
 
 #define TILE 512
 #ifndef ROWS_PER_BLOCK
