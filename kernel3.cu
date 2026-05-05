@@ -171,9 +171,9 @@ void sptrsv_gpu3(CSCMatrix* L_c, CSRMatrix* L_r, DenseMatrix* B, DenseMatrix* X,
         cudaMalloc(&c_A, c_size); cudaMalloc(&c_B, c_size);
         cudaMalloc(&residual, c_size);
 
-        // 2D launch config: threadIdx.x = col (coalesced), threadIdx.y = row
-        dim3 block2d(32, 8);  // 256 threads per block
-        dim3 grid2d((numCols + 31) / 32, (n + 7) / 8);
+        // 2D launch config (block.y=16 to keep grid.y < 65535 limit)
+        dim3 block2d(32, 16);  // 512 threads per block
+        dim3 grid2d((numCols + 31) / 32, (n + 15) / 16);
 
         // Initial PCR using B
         pcr_init_2d<<<grid2d, block2d>>>(n, csr_shadow.rowPtrs, csr_shadow.colIdxs, csr_shadow.values,
