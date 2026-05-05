@@ -2,95 +2,17 @@
 #include "matrix.h"
 
 #define TILE 512
-#define PCR_THREADS 256
+#ifndef ROWS_PER_BLOCK
+#define ROWS_PER_BLOCK 128
+#endif
 
 // ============================================================================
-// PCR Kernels - the ONE optimization
+// OPTIMIZATION: Exponential Backoff Atomic Synchronization
+// Reduces global memory contention on dep_counter for chain-like matrices
+// like tmt_sym. Wait time grows: 10ns -> 20ns -> 40ns -> ... -> 2560ns
 // ============================================================================
 
-__global__ void kernel3_pcr_init(
-    unsigned int  numRows,
-    unsigned int* rowPtrs,
-    unsigned int* colIdxs,
-    float*        matValues,
-    float*        bValues,
-    unsigned int  numCols,
-    float*        a_coeff,
-    float*        c_coeff
-) {
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= (int)numRows) return;
-    
-    float left = 0.0f, diag = 1.0f;
-    
-    unsigned int rowStart = rowPtrs[row];
-    unsigned int rowEnd = rowPtrs[row + 1];
-    
-    for (unsigned int j = rowStart; j < rowEnd; ++j) {
-        unsigned int c = colIdxs[j];
-        if ((int)c == row - 1) left = matValues[j];
-        else if ((int)c == row) diag = matValues[j];
-    }
-    
-    a_coeff[row] = (row > 0 && diag != 0.0f) ? (-left / diag) : 0.0f;
-    
-    float diag_inv = (diag != 0.0f) ? (1.0f / diag) : 1.0f;
-    for (unsigned int col = 0; col < numCols; col++) {
-        c_coeff[row * numCols + col] = bValues[row * numCols + col] * diag_inv;
-    }
-}
-
-__global__ void kernel3_pcr_step(
-    unsigned int numRows,
-    int offset,
-    float* a_in,
-    float* c_in,
-    float* a_out,
-    float* c_out,
-    unsigned int numCols
-) {
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= (int)numRows) return;
-    
-    int prev_row = row - offset;
-    
-    if (prev_row < 0) {
-        a_out[row] = 0.0f;
-        for (unsigned int col = 0; col < numCols; col++) {
-            c_out[row * numCols + col] = c_in[row * numCols + col];
-        }
-    } else {
-        float a_curr = a_in[row];
-        float a_prev = a_in[prev_row];
-        
-        a_out[row] = a_curr * a_prev;
-        for (unsigned int col = 0; col < numCols; col++) {
-            float c_curr = c_in[row * numCols + col];
-            float c_prev = c_in[prev_row * numCols + col];
-            c_out[row * numCols + col] = a_curr * c_prev + c_curr;
-        }
-    }
-}
-
-__global__ void kernel3_pcr_finalize(
-    unsigned int numRows,
-    unsigned int numCols,
-    float* c_coeff,
-    float* xValues
-) {
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= (int)numRows) return;
-    
-    for (unsigned int col = 0; col < numCols; col++) {
-        xValues[row * numCols + col] = c_coeff[row * numCols + col];
-    }
-}
-
-// ============================================================================
-// Fallback Kernel - same logic as your kernel2 (no new optimization)
-// ============================================================================
-
-__global__ void kernel3_fallback(
+__global__ void sptrsv_kernel3(
     unsigned int  numRows,
     unsigned int* rowPtrs,
     unsigned int* colIdxs,
@@ -124,8 +46,14 @@ __global__ void kernel3_fallback(
                 while (s_ready[r - 1] == 0) {}
             }
             if (row > 0) {
-                while (atomicAdd(&dep_counter[row], 0) < (int)row_dep_count[row]) {
-                    __nanosleep(10);
+                // *** OPTIMIZATION: Exponential backoff ***
+                int target = (int)row_dep_count[row];
+                int local_counter = atomicAdd(&dep_counter[row], 0);
+                int wait_ns = 20;
+                while (local_counter < target) {
+                    __nanosleep(wait_ns);
+                    local_counter = atomicAdd(&dep_counter[row], 0);
+                    if (wait_ns < 2560) wait_ns <<= 1;  // Double the wait
                 }
             }
         }
@@ -176,117 +104,56 @@ __global__ void kernel3_fallback(
     }
 }
 
-// ============================================================================
-// Main host function - your exact signature
-// ============================================================================
-
-void sptrsv_gpu3(CSCMatrix* L_c, CSRMatrix* L_r, DenseMatrix* B, DenseMatrix* X, 
+void sptrsv_gpu3(CSCMatrix* L_c, CSRMatrix* L_r, DenseMatrix* B, DenseMatrix* X,
                  CSCMatrix* L_c_host, CSRMatrix* L_r_host, unsigned int numCols)
 {
     unsigned int n = L_r_host->numRows;
 
-    // Detect if matrix is tridiagonal (suitable for PCR)
-    bool is_tridiagonal = true;
-    
-    for (unsigned int i = 0; i < n && is_tridiagonal; ++i) {
-        unsigned int dep_count = 0;
+    unsigned int* row_dep_count_h = (unsigned int*)calloc(n, sizeof(unsigned int));
+    unsigned int sequential_count = 0;
+
+    for (unsigned int i = 0; i < n; ++i) {
+        unsigned int count = 0;
+        bool depends_on_prev = false;
         for (unsigned int j = L_r_host->rowPtrs[i]; j < L_r_host->rowPtrs[i + 1]; ++j) {
-            unsigned int col = L_r_host->colIdxs[j];
-            if (col < i) {
-                dep_count++;
-                if (col != i - 1) {
-                    is_tridiagonal = false;
-                    break;
-                }
+            if (L_r_host->colIdxs[j] < i) {
+                count++;
+                if (L_r_host->colIdxs[j] == i - 1) depends_on_prev = true;
             }
         }
-        if (dep_count > 1) is_tridiagonal = false;
+        row_dep_count_h[i] = count;
+        if (depends_on_prev) sequential_count++;
     }
+
+    float seq_ratio = (n > 1) ? (float)sequential_count / (float)(n - 1) : 0.0f;
+    int rpb = (seq_ratio >= 0.5f) ? 128 : 1;
+
+    unsigned int* row_dep_count_d;
+    int* dep_counter_d;
+    cudaMalloc(&row_dep_count_d, n * sizeof(unsigned int));
+    cudaMalloc(&dep_counter_d, n * sizeof(int));
+    cudaMemcpy(row_dep_count_d, row_dep_count_h, n * sizeof(unsigned int), cudaMemcpyHostToDevice);
+    cudaMemset(dep_counter_d, 0, n * sizeof(int));
+    free(row_dep_count_h);
 
     CSRMatrix csr_shadow;
     cudaMemcpy(&csr_shadow, L_r, sizeof(CSRMatrix), cudaMemcpyDeviceToHost);
-    
+    CSCMatrix csc_shadow;
+    cudaMemcpy(&csc_shadow, L_c, sizeof(CSCMatrix), cudaMemcpyDeviceToHost);
     DenseMatrix b_shadow, x_shadow;
     cudaMemcpy(&b_shadow, B, sizeof(DenseMatrix), cudaMemcpyDeviceToHost);
     cudaMemcpy(&x_shadow, X, sizeof(DenseMatrix), cudaMemcpyDeviceToHost);
 
-    if (is_tridiagonal) {
-        // PCR PATH: O(log n) parallel solve
-        float *a_coeff_A, *c_coeff_A, *a_coeff_B, *c_coeff_B;
-        cudaMalloc(&a_coeff_A, n * sizeof(float));
-        cudaMalloc(&c_coeff_A, n * numCols * sizeof(float));
-        cudaMalloc(&a_coeff_B, n * sizeof(float));
-        cudaMalloc(&c_coeff_B, n * numCols * sizeof(float));
+    unsigned int smemSize = TILE * (sizeof(unsigned int) + sizeof(float)) + rpb * sizeof(int);
+    dim3 grid((n + rpb - 1) / rpb);
+    dim3 block(numCols);
 
-        dim3 block(PCR_THREADS);
-        dim3 grid((n + PCR_THREADS - 1) / PCR_THREADS);
+    sptrsv_kernel3<<<grid, block, smemSize>>>(
+        n, csr_shadow.rowPtrs, csr_shadow.colIdxs, csr_shadow.values,
+        csc_shadow.colPtrs, csc_shadow.rowIdxs, b_shadow.values, x_shadow.values,
+        numCols, dep_counter_d, row_dep_count_d, rpb
+    );
 
-        kernel3_pcr_init<<<grid, block>>>(
-            n, csr_shadow.rowPtrs, csr_shadow.colIdxs, csr_shadow.values,
-            b_shadow.values, numCols, a_coeff_A, c_coeff_A
-        );
-
-        float *a_in = a_coeff_A, *c_in = c_coeff_A;
-        float *a_out = a_coeff_B, *c_out = c_coeff_B;
-        
-        int offset = 1;
-        while (offset < (int)n) {
-            kernel3_pcr_step<<<grid, block>>>(
-                n, offset, a_in, c_in, a_out, c_out, numCols
-            );
-            float *tmp_a = a_in; a_in = a_out; a_out = tmp_a;
-            float *tmp_c = c_in; c_in = c_out; c_out = tmp_c;
-            offset *= 2;
-        }
-
-        kernel3_pcr_finalize<<<grid, block>>>(n, numCols, c_in, x_shadow.values);
-
-        cudaFree(a_coeff_A); cudaFree(c_coeff_A);
-        cudaFree(a_coeff_B); cudaFree(c_coeff_B);
-        
-    } else {
-        // FALLBACK PATH: same as kernel2
-        unsigned int* row_dep_count_h = (unsigned int*)calloc(n, sizeof(unsigned int));
-        unsigned int sequential_count = 0;
-
-        for (unsigned int i = 0; i < n; ++i) {
-            unsigned int count = 0;
-            bool depends_on_prev = false;
-            for (unsigned int j = L_r_host->rowPtrs[i]; j < L_r_host->rowPtrs[i + 1]; ++j) {
-                if (L_r_host->colIdxs[j] < i) {
-                    count++;
-                    if (L_r_host->colIdxs[j] == i - 1) depends_on_prev = true;
-                }
-            }
-            row_dep_count_h[i] = count;
-            if (depends_on_prev) sequential_count++;
-        }
-
-        float seq_ratio = (n > 1) ? (float)sequential_count / (float)(n - 1) : 0.0f;
-        int rpb = (seq_ratio >= 0.5f) ? 32 : 1;
-
-        unsigned int* row_dep_count_d;
-        int* dep_counter_d;
-        cudaMalloc(&row_dep_count_d, n * sizeof(unsigned int));
-        cudaMalloc(&dep_counter_d, n * sizeof(int));
-        cudaMemcpy(row_dep_count_d, row_dep_count_h, n * sizeof(unsigned int), cudaMemcpyHostToDevice);
-        cudaMemset(dep_counter_d, 0, n * sizeof(int));
-        free(row_dep_count_h);
-
-        CSCMatrix csc_shadow;
-        cudaMemcpy(&csc_shadow, L_c, sizeof(CSCMatrix), cudaMemcpyDeviceToHost);
-
-        unsigned int smemSize = TILE * (sizeof(unsigned int) + sizeof(float)) + rpb * sizeof(int);
-        dim3 grid((n + rpb - 1) / rpb);
-        dim3 block(numCols);
-
-        kernel3_fallback<<<grid, block, smemSize>>>(
-            n, csr_shadow.rowPtrs, csr_shadow.colIdxs, csr_shadow.values,
-            csc_shadow.colPtrs, csc_shadow.rowIdxs, b_shadow.values, x_shadow.values,
-            numCols, dep_counter_d, row_dep_count_d, rpb
-        );
-
-        cudaFree(dep_counter_d);
-        cudaFree(row_dep_count_d);
-    }
+    cudaFree(dep_counter_d);
+    cudaFree(row_dep_count_d);
 }
