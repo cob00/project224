@@ -3,79 +3,90 @@
 #include "matrix.h"
 
 #define TILE 512
-#define PCR_THREADS 256
-#define MAX_REFINE_ITERS 8
+#define MAX_REFINE_ITERS 3
 
 #ifndef ROWS_PER_BLOCK
 #define ROWS_PER_BLOCK 128
 #endif
 
-__global__ void pcr_init_full(
+// 2D PCR Init - coalesced memory access (threadIdx.x = col, threadIdx.y = row in block)
+__global__ void pcr_init_2d(
     unsigned int numRows, unsigned int* rowPtrs, unsigned int* colIdxs, float* matValues,
     float* rhs, unsigned int numCols, float* a_coeff, float* c_coeff
 ) {
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= (int)numRows) return;
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= (int)numRows || col >= (int)numCols) return;
+    
+    // Find left and diag (each thread does this; cheap since row entries are few)
     float left = 0.0f, diag = 1.0f;
     for (unsigned int j = rowPtrs[row]; j < rowPtrs[row + 1]; ++j) {
         unsigned int c = colIdxs[j];
         if ((int)c == row - 1) left = matValues[j];
         else if ((int)c == row) diag = matValues[j];
     }
-    a_coeff[row] = (row > 0 && diag != 0.0f) ? (-left / diag) : 0.0f;
+    
+    if (col == 0) a_coeff[row] = (row > 0 && diag != 0.0f) ? (-left / diag) : 0.0f;
+    
     float diag_inv = (diag != 0.0f) ? (1.0f / diag) : 1.0f;
-    for (unsigned int col = 0; col < numCols; col++)
-        c_coeff[row * numCols + col] = rhs[row * numCols + col] * diag_inv;
+    c_coeff[row * numCols + col] = rhs[row * numCols + col] * diag_inv;
 }
 
-__global__ void pcr_step(
-    unsigned int numRows, int offset,
-    float* a_in, float* c_in, float* a_out, float* c_out, unsigned int numCols
+// 2D PCR Step - coalesced
+__global__ void pcr_step_2d(
+    unsigned int numRows, int offset, unsigned int numCols,
+    float* a_in, float* c_in, float* a_out, float* c_out
 ) {
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= (int)numRows) return;
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= (int)numRows || col >= (int)numCols) return;
+    
     int prev_row = row - offset;
     if (prev_row < 0) {
-        a_out[row] = 0.0f;
-        for (unsigned int col = 0; col < numCols; col++)
-            c_out[row * numCols + col] = c_in[row * numCols + col];
+        c_out[row * numCols + col] = c_in[row * numCols + col];
+        if (col == 0) a_out[row] = 0.0f;
     } else {
-        float a_curr = a_in[row], a_prev = a_in[prev_row];
-        a_out[row] = a_curr * a_prev;
-        for (unsigned int col = 0; col < numCols; col++) {
-            c_out[row * numCols + col] = a_curr * c_in[prev_row * numCols + col] + c_in[row * numCols + col];
-        }
+        float a_curr = a_in[row];
+        float c_curr = c_in[row * numCols + col];
+        float c_prev = c_in[prev_row * numCols + col];
+        c_out[row * numCols + col] = a_curr * c_prev + c_curr;
+        if (col == 0) a_out[row] = a_curr * a_in[prev_row];
     }
 }
 
-__global__ void compute_residual(
+// 2D residual - coalesced
+__global__ void compute_residual_2d(
     unsigned int numRows, unsigned int* rowPtrs, unsigned int* colIdxs, float* matValues,
     float* X, float* B, float* R, unsigned int numCols
 ) {
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= (int)numRows) return;
-    for (unsigned int col = 0; col < numCols; col++) {
-        float sum = B[row * numCols + col];
-        for (unsigned int j = rowPtrs[row]; j < rowPtrs[row + 1]; ++j)
-            sum -= matValues[j] * X[colIdxs[j] * numCols + col];
-        R[row * numCols + col] = sum;
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= (int)numRows || col >= (int)numCols) return;
+    
+    float sum = B[row * numCols + col];
+    for (unsigned int j = rowPtrs[row]; j < rowPtrs[row + 1]; ++j) {
+        sum -= matValues[j] * X[colIdxs[j] * numCols + col];
     }
+    R[row * numCols + col] = sum;
 }
 
-__global__ void update_solution(float* X, float* dX, unsigned int numRows, unsigned int numCols) {
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= (int)numRows) return;
-    for (unsigned int col = 0; col < numCols; col++)
-        X[row * numCols + col] += dX[row * numCols + col];
+// 2D update solution
+__global__ void update_solution_2d(float* X, float* dX, unsigned int numRows, unsigned int numCols) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= (int)numRows || col >= (int)numCols) return;
+    X[row * numCols + col] += dX[row * numCols + col];
 }
 
-__global__ void pcr_finalize(unsigned int numRows, unsigned int numCols, float* c_coeff, float* xValues) {
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= (int)numRows) return;
-    for (unsigned int col = 0; col < numCols; col++)
-        xValues[row * numCols + col] = c_coeff[row * numCols + col];
+// 2D finalize
+__global__ void pcr_finalize_2d(unsigned int numRows, unsigned int numCols, float* c_coeff, float* xValues) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= (int)numRows || col >= (int)numCols) return;
+    xValues[row * numCols + col] = c_coeff[row * numCols + col];
 }
 
+// Fallback (kernel 2 logic)
 __global__ void kernel3_fallback(
     unsigned int numRows, unsigned int* rowPtrs, unsigned int* colIdxs, float* matValues,
     unsigned int* cscColPtrs, unsigned int* cscRowIdxs,
@@ -136,7 +147,7 @@ void sptrsv_gpu3(CSCMatrix* L_c, CSRMatrix* L_r, DenseMatrix* B, DenseMatrix* X,
 {
     unsigned int n = L_r_host->numRows;
 
-    // FIXED DETECTION: count rows that have an L[i,i-1] entry (not strict tridiagonal)
+    // Detect if matrix has L[i,i-1] for most rows
     int has_prev_count = 0;
     for (unsigned int i = 1; i < n; ++i) {
         for (unsigned int j = L_r_host->rowPtrs[i]; j < L_r_host->rowPtrs[i + 1]; ++j) {
@@ -152,42 +163,53 @@ void sptrsv_gpu3(CSCMatrix* L_c, CSRMatrix* L_r, DenseMatrix* B, DenseMatrix* X,
     cudaMemcpy(&x_shadow, X, sizeof(DenseMatrix), cudaMemcpyDeviceToHost);
 
     if (ratio > 0.95f) {
-        printf("  [PCR + refinement, has-prev-ratio=%.2f%%, %d iters]\n", ratio * 100, MAX_REFINE_ITERS);
-        size_t a_size = n * sizeof(float), c_size = n * numCols * sizeof(float);
+        printf("  [PCR + refinement (2D coalesced), %d iters]\n", MAX_REFINE_ITERS);
+        size_t a_size = n * sizeof(float);
+        size_t c_size = (size_t)n * numCols * sizeof(float);
         float *a_A, *a_B, *c_A, *c_B, *residual;
         cudaMalloc(&a_A, a_size); cudaMalloc(&a_B, a_size);
         cudaMalloc(&c_A, c_size); cudaMalloc(&c_B, c_size);
         cudaMalloc(&residual, c_size);
-        dim3 block(PCR_THREADS), grid((n + PCR_THREADS - 1) / PCR_THREADS);
-        
-        pcr_init_full<<<grid, block>>>(n, csr_shadow.rowPtrs, csr_shadow.colIdxs, csr_shadow.values,
-                                       b_shadow.values, numCols, a_A, c_A);
+
+        // 2D launch config: threadIdx.x = col (coalesced), threadIdx.y = row
+        dim3 block2d(32, 8);  // 256 threads per block
+        dim3 grid2d((numCols + 31) / 32, (n + 7) / 8);
+
+        // Initial PCR using B
+        pcr_init_2d<<<grid2d, block2d>>>(n, csr_shadow.rowPtrs, csr_shadow.colIdxs, csr_shadow.values,
+                                          b_shadow.values, numCols, a_A, c_A);
+
         float *a_in = a_A, *c_in = c_A, *a_out = a_B, *c_out = c_B;
         int offset = 1;
         while (offset < (int)n) {
-            pcr_step<<<grid, block>>>(n, offset, a_in, c_in, a_out, c_out, numCols);
-            float *t = a_in; a_in = a_out; a_out = t; t = c_in; c_in = c_out; c_out = t;
+            pcr_step_2d<<<grid2d, block2d>>>(n, offset, numCols, a_in, c_in, a_out, c_out);
+            float *t = a_in; a_in = a_out; a_out = t;
+            t = c_in; c_in = c_out; c_out = t;
             offset <<= 1;
         }
-        pcr_finalize<<<grid, block>>>(n, numCols, c_in, x_shadow.values);
+        pcr_finalize_2d<<<grid2d, block2d>>>(n, numCols, c_in, x_shadow.values);
 
+        // Iterative refinement
         for (int iter = 0; iter < MAX_REFINE_ITERS; iter++) {
-            compute_residual<<<grid, block>>>(n, csr_shadow.rowPtrs, csr_shadow.colIdxs,
-                                              csr_shadow.values, x_shadow.values, b_shadow.values, residual, numCols);
-            pcr_init_full<<<grid, block>>>(n, csr_shadow.rowPtrs, csr_shadow.colIdxs, csr_shadow.values,
-                                           residual, numCols, a_A, c_A);
+            compute_residual_2d<<<grid2d, block2d>>>(n, csr_shadow.rowPtrs, csr_shadow.colIdxs,
+                                                     csr_shadow.values, x_shadow.values, b_shadow.values, residual, numCols);
+            
+            pcr_init_2d<<<grid2d, block2d>>>(n, csr_shadow.rowPtrs, csr_shadow.colIdxs, csr_shadow.values,
+                                              residual, numCols, a_A, c_A);
             a_in = a_A; c_in = c_A; a_out = a_B; c_out = c_B;
             offset = 1;
             while (offset < (int)n) {
-                pcr_step<<<grid, block>>>(n, offset, a_in, c_in, a_out, c_out, numCols);
-                float *t = a_in; a_in = a_out; a_out = t; t = c_in; c_in = c_out; c_out = t;
+                pcr_step_2d<<<grid2d, block2d>>>(n, offset, numCols, a_in, c_in, a_out, c_out);
+                float *t = a_in; a_in = a_out; a_out = t;
+                t = c_in; c_in = c_out; c_out = t;
                 offset <<= 1;
             }
-            update_solution<<<grid, block>>>(x_shadow.values, c_in, n, numCols);
+            update_solution_2d<<<grid2d, block2d>>>(x_shadow.values, c_in, n, numCols);
         }
+
         cudaFree(a_A); cudaFree(a_B); cudaFree(c_A); cudaFree(c_B); cudaFree(residual);
     } else {
-        printf("  [Fallback, has-prev-ratio=%.2f%%]\n", ratio * 100);
+        printf("  [Fallback]\n");
         unsigned int* row_dep_count_h = (unsigned int*)calloc(n, sizeof(unsigned int));
         unsigned int sequential_count = 0;
         for (unsigned int i = 0; i < n; ++i) {
