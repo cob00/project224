@@ -3,7 +3,7 @@
 #include "matrix.h"
 
 #define TILE 512
-#define MAX_REFINE_ITERS 3
+#define MAX_REFINE_ITERS 5
 
 #ifndef ROWS_PER_BLOCK
 #define ROWS_PER_BLOCK 128
