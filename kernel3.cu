@@ -7,9 +7,11 @@
 #endif
 
 // ============================================================================
-// OPTIMIZATION: Exponential Backoff Atomic Synchronization
-// Reduces global memory contention on dep_counter for chain-like matrices
-// like tmt_sym. Wait time grows: 10ns -> 20ns -> 40ns -> ... -> 2560ns
+// OPTIMIZATION: Skip Redundant Atomic Synchronization
+// For chain matrices, when row i depends only on row i-1 (which is in the
+// same block), the in-block s_ready[] flag already proves the dependency
+// is satisfied. The global atomic spin-wait is REDUNDANT and can be skipped.
+// This eliminates ~127/128 atomic spin-waits for tmt_sym.
 // ============================================================================
 
 __global__ void sptrsv_kernel3(
@@ -24,6 +26,7 @@ __global__ void sptrsv_kernel3(
     unsigned int  numCols,
     int*          dep_counter,
     unsigned int* row_dep_count,
+    unsigned int* skip_atomic,
     int           rows_per_block
 ) {
     extern __shared__ char smem[];
@@ -45,15 +48,19 @@ __global__ void sptrsv_kernel3(
             if (r > 0) {
                 while (s_ready[r - 1] == 0) {}
             }
-            if (row > 0) {
-                // *** OPTIMIZATION: Exponential backoff ***
+
+            // *** OPTIMIZATION: Skip atomic when in-block sync is sufficient ***
+            // Skip if: r > 0 AND row's only dep is on i-1 (which is in same block)
+            bool can_skip = (r > 0) && (skip_atomic[row] != 0);
+            
+            if (row > 0 && !can_skip) {
                 int target = (int)row_dep_count[row];
                 int local_counter = atomicAdd(&dep_counter[row], 0);
-                int wait_ns = 20;
+                int wait_ns = 32;
                 while (local_counter < target) {
                     __nanosleep(wait_ns);
                     local_counter = atomicAdd(&dep_counter[row], 0);
-                    if (wait_ns < 2560) wait_ns <<= 1;  // Double the wait
+                    if (wait_ns < 2048) wait_ns <<= 1;
                 }
             }
         }
@@ -110,6 +117,7 @@ void sptrsv_gpu3(CSCMatrix* L_c, CSRMatrix* L_r, DenseMatrix* B, DenseMatrix* X,
     unsigned int n = L_r_host->numRows;
 
     unsigned int* row_dep_count_h = (unsigned int*)calloc(n, sizeof(unsigned int));
+    unsigned int* skip_atomic_h = (unsigned int*)calloc(n, sizeof(unsigned int));
     unsigned int sequential_count = 0;
 
     for (unsigned int i = 0; i < n; ++i) {
@@ -123,18 +131,25 @@ void sptrsv_gpu3(CSCMatrix* L_c, CSRMatrix* L_r, DenseMatrix* B, DenseMatrix* X,
         }
         row_dep_count_h[i] = count;
         if (depends_on_prev) sequential_count++;
+        
+        // *** Mark rows that can skip atomic check (only dep is on i-1) ***
+        skip_atomic_h[i] = (count == 1 && depends_on_prev) ? 1 : 0;
     }
 
     float seq_ratio = (n > 1) ? (float)sequential_count / (float)(n - 1) : 0.0f;
     int rpb = (seq_ratio >= 0.5f) ? 128 : 1;
 
     unsigned int* row_dep_count_d;
+    unsigned int* skip_atomic_d;
     int* dep_counter_d;
     cudaMalloc(&row_dep_count_d, n * sizeof(unsigned int));
+    cudaMalloc(&skip_atomic_d, n * sizeof(unsigned int));
     cudaMalloc(&dep_counter_d, n * sizeof(int));
     cudaMemcpy(row_dep_count_d, row_dep_count_h, n * sizeof(unsigned int), cudaMemcpyHostToDevice);
+    cudaMemcpy(skip_atomic_d, skip_atomic_h, n * sizeof(unsigned int), cudaMemcpyHostToDevice);
     cudaMemset(dep_counter_d, 0, n * sizeof(int));
     free(row_dep_count_h);
+    free(skip_atomic_h);
 
     CSRMatrix csr_shadow;
     cudaMemcpy(&csr_shadow, L_r, sizeof(CSRMatrix), cudaMemcpyDeviceToHost);
@@ -151,9 +166,10 @@ void sptrsv_gpu3(CSCMatrix* L_c, CSRMatrix* L_r, DenseMatrix* B, DenseMatrix* X,
     sptrsv_kernel3<<<grid, block, smemSize>>>(
         n, csr_shadow.rowPtrs, csr_shadow.colIdxs, csr_shadow.values,
         csc_shadow.colPtrs, csc_shadow.rowIdxs, b_shadow.values, x_shadow.values,
-        numCols, dep_counter_d, row_dep_count_d, rpb
+        numCols, dep_counter_d, row_dep_count_d, skip_atomic_d, rpb
     );
 
     cudaFree(dep_counter_d);
     cudaFree(row_dep_count_d);
+    cudaFree(skip_atomic_d);
 }
